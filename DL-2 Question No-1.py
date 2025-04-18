@@ -1,101 +1,119 @@
 #Question No-1
-import tensorflow as tf
 import numpy as np
+import pandas as pd
+import os
+from tensorflow import keras
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Embedding, Dense, Input, LSTM, GRU, SimpleRNN
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.layers import Input, LSTM, Dense
 
-# ------------------------
-# Custom Config
-# ------------------------
-embed_sz = 32
-units = 64
-depth = 1
-cell_kind = 'LSTM'  # 'GRU' or 'RNN'
+# Parameters
+batch_size = 64
+epochs = 200
+latent_dim = 256
+num_samples = 50000  # Limit the number of training samples
 
-# ------------------------
-# Sample Character Data
-# ------------------------
-eng = ['dil', 'pyar', 'namaste']
-hin = ['दिल', 'प्यार', 'नमस्ते']
+# Path to the Dakshina dataset (adjust if you have different path)
+data_path = "/hi.translit.sampled.train.tsv"
 
-def tokenize(char_list):
-    chars = sorted(set(''.join(char_list)))
-    c2i = {c: i+1 for i, c in enumerate(chars)}
-    i2c = {i: c for c, i in c2i.items()}
-    return c2i, i2c
+# Step 1: Load the dataset
+input_texts = []
+target_texts = []
+input_characters = set()
+target_characters = set()
 
-src_vocab, rev_src = tokenize(eng)
-tgt_vocab, rev_tgt = tokenize(hin)
+with open(data_path, "r", encoding="utf-8") as f:
+    lines = f.read().split("\n")
 
-src_vocab_len = len(src_vocab) + 1
-tgt_vocab_len = len(tgt_vocab) + 1
+for line in lines[: min(num_samples, len(lines) - 1)]:
+    native, latin, attested = line.split("\t")
+    input_text = latin.strip()
+    target_text = "\t" + native.strip() + "\n"  # Start and end tokens
 
-# ------------------------
-# Encode and pad
-# ------------------------
-def encode_sequence(word_list, mapper):
-    return [[mapper[ch] for ch in word] for word in word_list]
+    input_texts.append(input_text)
+    target_texts.append(target_text)
 
-src_encoded = encode_sequence(eng, src_vocab)
-tgt_encoded = encode_sequence(hin, tgt_vocab)
+    for char in input_text:
+        input_characters.add(char)
+    for char in target_text:
+        target_characters.add(char)
 
-sos_token = tgt_vocab_len
-eos_token = tgt_vocab_len + 1
+# Add space character to both input and target characters if not already included
+input_characters.add(" ")
+target_characters.add(" ")
 
-dec_input = pad_sequences([[sos_token] + seq for seq in tgt_encoded], padding='post')
-dec_output = pad_sequences([seq + [eos_token] for seq in tgt_encoded], padding='post')
-dec_output = np.expand_dims(dec_output, -1)
-src_input = pad_sequences(src_encoded, padding='post')
+# Rebuild the input_token_index and target_token_index after adding space
+input_characters = sorted(list(input_characters))
+target_characters = sorted(list(target_characters))
+num_encoder_tokens = len(input_characters)
+num_decoder_tokens = len(target_characters)
+max_encoder_seq_length = max([len(txt) for txt in input_texts])
+max_decoder_seq_length = max([len(txt) for txt in target_texts])
 
-# ------------------------
-# RNN Selector
-# ------------------------
-def make_rnn(units, name, return_sequences=False, return_state=True):
-    if cell_kind == 'GRU':
-        return GRU(units, name=name, return_sequences=return_sequences, return_state=return_state)
-    elif cell_kind == 'RNN':
-        return SimpleRNN(units, name=name, return_sequences=return_sequences, return_state=return_state)
-    else:
-        return LSTM(units, name=name, return_sequences=return_sequences, return_state=return_state)
+print("Number of samples:", len(input_texts))
+print("Number of unique input tokens:", num_encoder_tokens)
+print("Number of unique output tokens:", num_decoder_tokens)
+print("Max sequence length for inputs:", max_encoder_seq_length)
+print("Max sequence length for outputs:", max_decoder_seq_length)
 
-# ------------------------
-# Model Assembly
-# ------------------------
-enc_input_layer = Input(shape=(None,), name="src_input")
-enc_embed = Embedding(input_dim=src_vocab_len, output_dim=embed_sz, mask_zero=True, name="src_embed")(enc_input_layer)
+input_token_index = dict([(char, i) for i, char in enumerate(input_characters)])
+target_token_index = dict([(char, i) for i, char in enumerate(target_characters)])
 
-# Encoder Stack
-enc_out = enc_embed
-states = []
-for layer_num in range(depth):
-    rnn = make_rnn(units, name=f"enc_rnn_{layer_num}")
-    if cell_kind == 'LSTM':
-        enc_out, state_h, state_c = rnn(enc_out)
-        states = [state_h, state_c]
-    else:
-        enc_out, state_h = rnn(enc_out)
-        states = [state_h]
+# Step 2: Create empty arrays to store one-hot encodings
+encoder_input_data = np.zeros(
+    (len(input_texts), max_encoder_seq_length, num_encoder_tokens), dtype="float32"
+)
+decoder_input_data = np.zeros(
+    (len(input_texts), max_decoder_seq_length, num_decoder_tokens), dtype="float32"
+)
+decoder_target_data = np.zeros(
+    (len(input_texts), max_decoder_seq_length, num_decoder_tokens), dtype="float32"
+)
 
-dec_input_layer = Input(shape=(None,), name="tgt_input")
-dec_embed = Embedding(input_dim=tgt_vocab_len + 2, output_dim=embed_sz, mask_zero=True, name="tgt_embed")(dec_input_layer)
+# Step 3: Fill in the one-hot encoded arrays
+for i, (input_text, target_text) in enumerate(zip(input_texts, target_texts)):
+    for t, char in enumerate(input_text):
+        encoder_input_data[i, t, input_token_index[char]] = 1.0
+    encoder_input_data[i, t + 1 :, input_token_index[" "]] = 1.0  # Fix added here
+    for t, char in enumerate(target_text):
+        decoder_input_data[i, t, target_token_index[char]] = 1.0
+        if t > 0:
+            decoder_target_data[i, t - 1, target_token_index[char]] = 1.0
+    decoder_input_data[i, t + 1 :, target_token_index[" "]] = 1.0
+    decoder_target_data[i, t:, target_token_index[" "]] = 1.0
 
-# Decoder Stack
-dec_out = dec_embed
-for layer_num in range(depth):
-    rnn = make_rnn(units, name=f"dec_rnn_{layer_num}", return_sequences=True)
-    if cell_kind == 'LSTM':
-        dec_out, _, _ = rnn(dec_out, initial_state=states)
-    else:
-        dec_out, _ = rnn(dec_out, initial_state=states)
+# Define the sequence-to-sequence model
+# Step 4: Define Encoder and Decoder Model
+# Encoder model
+encoder_inputs = Input(shape=(None, num_encoder_tokens))
+encoder = LSTM(latent_dim, return_state=True)
+encoder_outputs, state_h, state_c = encoder(encoder_inputs)
 
-final_dense = Dense(tgt_vocab_len + 2, activation='softmax', name="out_layer")(dec_out)
+# We discard `encoder_outputs` and only keep the states.
+encoder_states = [state_h, state_c]
 
-model = Model(inputs=[enc_input_layer, dec_input_layer], outputs=final_dense)
-model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-model.summary()
+# Decoder model
+decoder_inputs = Input(shape=(None, num_decoder_tokens))
+decoder_lstm = LSTM(latent_dim, return_sequences=True, return_state=True)
+decoder_outputs, _, _ = decoder_lstm(decoder_inputs, initial_state=encoder_states)
 
-# ------------------------
-# Train
-# ------------------------
-model.fit([src_input, dec_input], dec_output, batch_size=2, epochs=50)
+decoder_dense = Dense(num_decoder_tokens, activation="softmax")
+decoder_outputs = decoder_dense(decoder_outputs)
+
+# Define the model that will turn encoder_input_data & decoder_input_data into decoder_target_data
+model = Model([encoder_inputs, decoder_inputs], decoder_outputs)
+
+# Step 5: Compile and train the model
+model.compile(
+    optimizer="rmsprop", loss="categorical_crossentropy", metrics=["accuracy"]
+)
+
+model.fit(
+    [encoder_input_data, decoder_input_data],
+    decoder_target_data,
+    batch_size=batch_size,
+    epochs=epochs,
+    validation_split=0.2,
+)
+
+# Save the model after training
+model.save("s2s_model.keras")
